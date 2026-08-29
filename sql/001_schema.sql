@@ -1,104 +1,108 @@
 -- =============================================================================
--- Pipeline de indicadores do BCB — schema inicial
+-- BCB indicators pipeline — initial schema
 --
--- Modelo em três tabelas:
---   series      catálogo dos indicadores acompanhados
---   observacoes valores no tempo (o fato)
---   execucoes   log de cada rodada do pipeline
+-- Three tables:
+--   series        catalog of tracked indicators
+--   observations  values over time (the fact table)
+--   runs          execution log, one row per series per pipeline run
 --
--- Script idempotente: pode ser executado mais de uma vez sem erro.
+-- This script is idempotent: it can be executed more than once safely.
 -- =============================================================================
 
 CREATE SCHEMA IF NOT EXISTS bcb;
 
 
 -- -----------------------------------------------------------------------------
--- series — catálogo dos indicadores
--- A chave primária é o código da série no SGS do BCB, que já é único e estável.
+-- series — catalog of tracked indicators
+-- The primary key is the SGS series code, which is already unique and stable.
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS bcb.series (
-    codigo_serie   INTEGER      PRIMARY KEY,
-    nome           TEXT         NOT NULL,
-    unidade        TEXT,
-    periodicidade  TEXT,
-    fonte          TEXT         NOT NULL DEFAULT 'BCB/SGS',
-    ativo          BOOLEAN      NOT NULL DEFAULT TRUE,
-    criado_em      TIMESTAMPTZ  NOT NULL DEFAULT now(),
-    atualizado_em  TIMESTAMPTZ  NOT NULL DEFAULT now()
+    series_code   INTEGER      PRIMARY KEY,
+    name          TEXT         NOT NULL,
+    unit          TEXT,
+    frequency     TEXT,
+    source        TEXT         NOT NULL DEFAULT 'BCB/SGS',
+    is_active     BOOLEAN      NOT NULL DEFAULT TRUE,
+    created_at    TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
 
-COMMENT ON TABLE  bcb.series IS 'Catálogo dos indicadores acompanhados pelo pipeline.';
-COMMENT ON COLUMN bcb.series.codigo_serie IS 'Código da série no SGS do Banco Central.';
-COMMENT ON COLUMN bcb.series.ativo IS 'Séries inativas permanecem no histórico mas não são coletadas.';
+COMMENT ON TABLE  bcb.series IS 'Catalog of economic indicators tracked by the pipeline.';
+COMMENT ON COLUMN bcb.series.series_code IS 'Series code in the Brazilian Central Bank SGS system.';
+COMMENT ON COLUMN bcb.series.is_active IS 'Inactive series stay in history but are no longer collected.';
 
 
 -- -----------------------------------------------------------------------------
--- observacoes — os valores no tempo
+-- observations — values over time
 --
--- A chave primária composta (codigo_serie, data_referencia) é o que torna a
--- carga idempotente: a própria estrutura da tabela impede que a mesma
--- observação entre duas vezes. Rodar o pipeline de novo atualiza, não duplica.
+-- The composite primary key (series_code, reference_date) is what makes the
+-- load idempotent: the table structure itself prevents the same observation
+-- from being stored twice. Re-running the pipeline updates, never duplicates.
 -- -----------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS bcb.observacoes (
-    codigo_serie    INTEGER      NOT NULL REFERENCES bcb.series (codigo_serie),
-    data_referencia DATE         NOT NULL,
-    valor           NUMERIC(18,6),
-    ingerido_em     TIMESTAMPTZ  NOT NULL DEFAULT now(),
-    atualizado_em   TIMESTAMPTZ  NOT NULL DEFAULT now(),
-    PRIMARY KEY (codigo_serie, data_referencia)
+CREATE TABLE IF NOT EXISTS bcb.observations (
+    series_code     INTEGER      NOT NULL REFERENCES bcb.series (series_code),
+    reference_date  DATE         NOT NULL,
+    value           NUMERIC(18,6),
+    ingested_at     TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    PRIMARY KEY (series_code, reference_date)
 );
 
-COMMENT ON TABLE  bcb.observacoes IS 'Valores observados de cada série ao longo do tempo.';
-COMMENT ON COLUMN bcb.observacoes.valor IS 'NUMERIC, não FLOAT: valor econômico não admite erro de arredondamento binário.';
+COMMENT ON TABLE  bcb.observations IS 'Observed values for each series over time.';
+COMMENT ON COLUMN bcb.observations.value IS 'NUMERIC, not FLOAT: economic values must not carry binary rounding error.';
 
--- Índice para a consulta mais comum: uma série num intervalo de datas.
-CREATE INDEX IF NOT EXISTS ix_observacoes_serie_data
-    ON bcb.observacoes (codigo_serie, data_referencia DESC);
+-- Index for the most common query: one series over a date range.
+CREATE INDEX IF NOT EXISTS ix_observations_series_date
+    ON bcb.observations (series_code, reference_date DESC);
 
 
 -- -----------------------------------------------------------------------------
--- execucoes — log de cada rodada
+-- runs — execution log
 --
--- Sem isso, "de quando é esse número?" e "por que a carga de ontem falhou?"
--- viram chute. Um pipeline que não registra a própria execução não é auditável.
+-- Without this, "how fresh is this number?" and "why did yesterday's load
+-- bring nothing?" become guesswork. A pipeline that does not record its own
+-- execution is not auditable.
 -- -----------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS bcb.execucoes (
-    id                     BIGSERIAL    PRIMARY KEY,
-    codigo_serie           INTEGER      REFERENCES bcb.series (codigo_serie),
-    iniciado_em            TIMESTAMPTZ  NOT NULL DEFAULT now(),
-    finalizado_em          TIMESTAMPTZ,
-    status                 TEXT         NOT NULL DEFAULT 'EM_ANDAMENTO',
-    data_inicial_solicitada DATE,
-    data_final_solicitada   DATE,
-    registros_recebidos    INTEGER      NOT NULL DEFAULT 0,
-    registros_inseridos    INTEGER      NOT NULL DEFAULT 0,
-    registros_atualizados  INTEGER      NOT NULL DEFAULT 0,
-    tentativas             INTEGER      NOT NULL DEFAULT 1,
-    mensagem_erro          TEXT,
-    CONSTRAINT ck_execucoes_status
-        CHECK (status IN ('EM_ANDAMENTO', 'SUCESSO', 'FALHA', 'SEM_DADOS'))
+CREATE TABLE IF NOT EXISTS bcb.runs (
+    id                  BIGSERIAL    PRIMARY KEY,
+    series_code         INTEGER      REFERENCES bcb.series (series_code),
+    started_at          TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    finished_at         TIMESTAMPTZ,
+    status              TEXT         NOT NULL DEFAULT 'RUNNING',
+    requested_start_date DATE,
+    requested_end_date   DATE,
+    records_received    INTEGER      NOT NULL DEFAULT 0,
+    records_inserted    INTEGER      NOT NULL DEFAULT 0,
+    records_updated     INTEGER      NOT NULL DEFAULT 0,
+    attempts            INTEGER      NOT NULL DEFAULT 1,
+    error_message       TEXT,
+    CONSTRAINT ck_runs_status
+        CHECK (status IN ('RUNNING', 'SUCCESS', 'FAILED', 'NO_DATA'))
 );
 
-COMMENT ON TABLE bcb.execucoes IS 'Log de auditoria: uma linha por série por rodada do pipeline.';
+COMMENT ON TABLE bcb.runs IS 'Audit log: one row per series per pipeline run.';
 
-CREATE INDEX IF NOT EXISTS ix_execucoes_iniciado_em
-    ON bcb.execucoes (iniciado_em DESC);
+CREATE INDEX IF NOT EXISTS ix_runs_started_at
+    ON bcb.runs (started_at DESC);
 
 
 -- -----------------------------------------------------------------------------
--- Séries acompanhadas
+-- Tracked series
 --
--- ON CONFLICT DO UPDATE: se a série já existir, atualiza os metadados em vez
--- de falhar. É o mesmo padrão de upsert usado na ingestão das observações.
+-- Series names are kept in Portuguese on purpose: they are the official names
+-- of the indicators, not a naming choice. Identifiers are English; data is not.
+--
+-- ON CONFLICT DO UPDATE: if the series already exists, refresh its metadata
+-- instead of failing. Same upsert pattern used when loading observations.
 -- -----------------------------------------------------------------------------
-INSERT INTO bcb.series (codigo_serie, nome, unidade, periodicidade) VALUES
-    (   432, 'Taxa Selic — meta definida pelo Copom', '% a.a.',      'diaria'),
-    (   433, 'IPCA — variação mensal',                '% no mês',    'mensal'),
-    ( 13522, 'IPCA — acumulado em 12 meses',          '% em 12m',    'mensal'),
-    (  3698, 'Dólar PTAX — venda',                    'R$/US$',      'diaria'),
-    ( 24364, 'IBC-Br — índice de atividade econômica','índice',      'mensal')
-ON CONFLICT (codigo_serie) DO UPDATE SET
-    nome          = EXCLUDED.nome,
-    unidade       = EXCLUDED.unidade,
-    periodicidade = EXCLUDED.periodicidade,
-    atualizado_em = now();
+INSERT INTO bcb.series (series_code, name, unit, frequency) VALUES
+    (   432, 'Taxa Selic — meta definida pelo Copom',    '% a.a.',   'daily'),
+    (   433, 'IPCA — variação mensal',                   '% no mês', 'monthly'),
+    ( 13522, 'IPCA — acumulado em 12 meses',             '% em 12m', 'monthly'),
+    (  3698, 'Dólar PTAX — venda',                       'R$/US$',   'daily'),
+    ( 24364, 'IBC-Br — índice de atividade econômica',   'índice',   'monthly')
+ON CONFLICT (series_code) DO UPDATE SET
+    name       = EXCLUDED.name,
+    unit       = EXCLUDED.unit,
+    frequency  = EXCLUDED.frequency,
+    updated_at = now();
