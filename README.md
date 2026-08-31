@@ -1,6 +1,8 @@
 # pipeline-indicadores-bcb
 
-Pipeline de ingestão de indicadores econômicos do Banco Central (SGS/BCB) para PostgreSQL, com carga incremental idempotente, retomada após falha e validação de dados.
+![Carga diária](https://github.com/mrmansini/pipeline-indicadores-bcb/actions/workflows/pipeline.yml/badge.svg)
+
+Pipeline de ingestão de indicadores econômicos do Banco Central (SGS/BCB) para PostgreSQL, com carga incremental idempotente, retomada após falha, validação de dados e execução diária automatizada.
 
 Projeto pessoal, construído para exercitar em dado público os mesmos padrões que uso em produção: integração com API instável, escrita idempotente, log de auditoria e verificação de qualidade antes de o dado chegar em quem decide.
 
@@ -19,15 +21,24 @@ flowchart TD
     C -->|"upsert idempotente"| D[("PostgreSQL")]
     C -->|"log de execução"| D
     D --> E["checks<br/><i>a carga é confiável?</i>"]
+    D --> F["camada analytics<br/><i>dimensões e fato para BI</i>"]
 ```
 
 ## Modelo de dados
 
 | Tabela | Papel |
 |---|---|
-| `bcb.series` | Catálogo dos indicadores. Governa o comportamento da coleta: periodicidade define o tamanho da janela, defasagem esperada define o limite de alerta. |
+| `bcb.series` | Catálogo dos indicadores. Governa o comportamento da coleta: periodicidade define o tamanho da janela, defasagem esperada define o limite de alerta, nome curto define o rótulo em interface. |
 | `bcb.observations` | Os valores no tempo. Chave primária composta `(series_code, reference_date)`. |
 | `bcb.runs` | Log de auditoria: uma linha por série por execução, com status, contagens e mensagem de erro. |
+
+Sobre essas tabelas existe o schema `analytics`, com um modelo estrela para consumo em BI: `dim_series`, `dim_calendar`, `fct_observations`, mais `v_series_latest` (resumo) e `v_pipeline_health` (saúde da carga).
+
+## Operação
+
+A carga roda **diariamente às 07:00 (horário de Brasília) pelo GitHub Actions**, contra um PostgreSQL gerenciado. A validação de qualidade roda em seguida e reprova a execução quando encontra erro, então uma falha aparece como execução vermelha na aba Actions em vez de passar despercebida.
+
+O banco começou local e foi migrado para nuvem **sem alterar uma linha de código** — apenas a variável `DATABASE_URL`. Foi o que permitiu tirar a execução da máquina pessoal.
 
 ## Como rodar
 
@@ -47,9 +58,12 @@ cp .env.example .env             # preencha a DATABASE_URL
 Crie o schema, na ordem:
 
 ```bash
-psql -d bcb_indicadores -f sql/001_schema.sql
-psql -d bcb_indicadores -f sql/002_fix_series_metadata.sql
-psql -d bcb_indicadores -f sql/003_add_max_lag_days.sql
+psql "$DATABASE_URL" -f sql/001_schema.sql
+psql "$DATABASE_URL" -f sql/002_fix_series_metadata.sql
+psql "$DATABASE_URL" -f sql/003_add_max_lag_days.sql
+psql "$DATABASE_URL" -f sql/004_analytics_views.sql
+psql "$DATABASE_URL" -f sql/005_fix_encoding.sql
+psql "$DATABASE_URL" -f sql/006_add_short_name.sql
 ```
 
 Execute:
@@ -71,7 +85,9 @@ O `checks.py` sai com código 1 quando encontra erro, o que permite usá-lo como
 
 **Commit por janela, com parada no primeiro buraco.** A coleta entrega janela a janela e grava cada uma. A falha da nona janela não custa as oito anteriores. Mas a exceção interrompe a série inteira em vez de pular para a décima — e isso é deliberado: como a retomada é calculada por `MAX(reference_date)`, pular por cima de uma janela criaria uma lacuna que a carga incremental nunca voltaria para preencher, porque ela só olha para frente.
 
-**O catálogo governa o comportamento.** Periodicidade define o tamanho da janela de coleta; defasagem esperada define o limite de alerta de atualidade. Adicionar uma série nova é um `INSERT`, não uma alteração de código. O efeito colateral é que metadado errado vira comportamento errado — foi o que aconteceu, e está descrito abaixo.
+**O catálogo governa o comportamento.** Periodicidade define o tamanho da janela de coleta; defasagem esperada define o limite de alerta de atualidade; nome curto define o rótulo em interface. Adicionar uma série nova é um `INSERT`, não uma alteração de código. O efeito colateral é que metadado errado vira comportamento errado — foi o que aconteceu, e está descrito abaixo.
+
+**Regra de negócio no banco, apresentação no BI.** A camada `analytics` entrega o dado com o significado já resolvido, em views versionadas em Git. Ferramenta de BI cuida de recorte, filtro e visual. Foi essa separação que permitiu apontar mais de uma ferramenta para o mesmo modelo sem reescrever nada.
 
 **`NUMERIC`, não `FLOAT`.** Valor econômico não admite erro de arredondamento binário.
 
@@ -115,27 +131,39 @@ As seis validações:
 
 Os dois últimos foram calibrados contra alarme falso, e por um motivo: alerta que dispara para problema já resolvido treina as pessoas a ignorar alerta, e alerta ignorado é pior que alerta nenhum, porque dá sensação de cobertura que não existe. A defasagem aceitável saiu de um valor por periodicidade para um valor por série, porque IPCA e IBC-Br são ambos mensais mas o segundo é divulgado com dois meses de atraso. E a checagem de falhas passou a ignorar erro que o pipeline superou sozinho na execução seguinte.
 
+## Visualização
+
+O relatório principal foi construído em Power BI sobre as views de `analytics`, em modelo estrela, com três páginas: panorama dos indicadores, série histórica com exploração por indicador, e saúde da carga.
+
+Essa última página é a menos comum e a que eu considero mais importante: ela mostra a taxa de sucesso das execuções, o volume gravado e as falhas com a mensagem de erro. Um painel que não expõe a saúde da própria carga esconde justamente o que o leitor precisa para confiar no número.
+
 ## Limitações e próximos passos
 
 - **Sem testes automatizados.** A validação cobre o dado, não a lógica. Teste de unidade sobre o janelamento e o parsing é o próximo passo natural, e a ausência é uma dívida consciente.
-- **Sem agendamento.** A execução é manual. O passo seguinte é agendar a carga diária e disparar o `checks.py` como portão.
-- **Sem camada de apresentação.** O destino natural é um dashboard lendo direto do banco.
 - **A janela de 30 dias de sobreposição é fixa.** Suficiente para revisão de índice mensal, mas é um número escolhido por bom senso, não medido contra o histórico real de revisões.
 - **Sem histórico de revisão.** Quando um valor é revisado, o anterior é sobrescrito. Guardar a versão antiga permitiria responder "o que a gente sabia naquela data?" — pergunta relevante em análise econômica.
+- **A falha não notifica ninguém.** Ela fica visível na aba Actions, o que resolve para um projeto pessoal, mas não equivale a alerta ativo.
 
 ## Estrutura
 
 ```
+├── .github/workflows/
+│   └── pipeline.yml                   carga diária automatizada
 ├── sql/
 │   ├── 001_schema.sql                 estrutura inicial
 │   ├── 002_fix_series_metadata.sql    correção de periodicidade
-│   └── 003_add_max_lag_days.sql       defasagem esperada por série
+│   ├── 003_add_max_lag_days.sql       defasagem esperada por série
+│   ├── 004_analytics_views.sql        camada analítica para BI
+│   ├── 005_fix_encoding.sql           correção de encoding
+│   └── 006_add_short_name.sql         nome curto para exibição
 ├── src/
 │   ├── config.py                      variáveis de ambiente e constantes
 │   ├── bcb_client.py                  cliente do SGS: janelamento, retry, parsing
 │   ├── db.py                          conexão, upsert e log
 │   ├── pipeline.py                    orquestração
 │   └── checks.py                      validações de qualidade
+├── docs/
+│   └── tema-bcb-institucional.json    tema do relatório
 ├── .env.example
 └── requirements.txt
 ```
