@@ -1,0 +1,51 @@
+name: Carga diária de indicadores
+
+# A carga roda todo dia de manhã e também pode ser disparada à mão pela aba
+# Actions, o que é útil para testar sem esperar o horário.
+on:
+  schedule:
+    # 10:00 UTC = 07:00 no horário de Brasília. O GitHub executa cron em UTC e
+    # não ajusta horário de verão, então o horário local pode variar uma hora.
+    - cron: "0 10 * * *"
+  workflow_dispatch:
+
+# Evita que duas execuções escrevam no banco ao mesmo tempo — a carga é
+# idempotente, mas concorrência gera log confuso e gasta compute à toa.
+concurrency:
+  group: carga-indicadores
+  cancel-in-progress: false
+
+jobs:
+  carga:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Baixar o repositório
+        uses: actions/checkout@v4
+
+      - name: Preparar o Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
+
+      - name: Executar a carga
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          BCB_TIMEOUT: "30"
+          BCB_MAX_RETRIES: "5"
+        run: python src/pipeline.py
+
+      # A validação roda mesmo que a carga falhe: se uma série não veio, ainda
+      # importa saber em que estado o banco ficou. E o código de saída dela
+      # reprova o job, deixando o problema visível na aba Actions em vez de
+      # escondido no fim de um log.
+      - name: Validar a qualidade dos dados
+        if: always()
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python src/checks.py
